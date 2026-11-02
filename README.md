@@ -25,6 +25,14 @@ uv run pytest -q          # 单元测试，用假 agent，不花钱
 
 tunnel-client 用 `--mcp-server-url http://127.0.0.1:8765/mcp` 连过来。部署、开机自启、配置项和技术细节见 [AGENTS.md](AGENTS.md)。
 
+## P1 配置与限制
+
+将 `agents.example.toml` 复制到 `~/.config/agent-gateway/agents.toml`，按实际安装位置修改命令数组；也可以通过 `DOT_GATEWAY_AGENTS_FILE` 指定文件。配置文件存在时只加载其中声明的 agent；没有该文件时沿用旧版 JSON 配置和内置 dsh。每个 agent 的 `policy` 默认为 `full`，可设为 `operator`；`approval_timeout` 默认为 600 秒，`max_sessions` 默认为 4。`cwd_roots` 可在 agent 内覆盖全局的 `defaults.cwd_roots`，全局默认只允许 `~/cyq`。
+
+网关只向子进程传递基础环境变量及 `env_allow` 中列出的变量，旧 JSON 部署也经过同样的白名单；如需代理，须将 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 等加入 agent 的 `env_allow`。agent 和模式显式配置的环境变量也经过密钥名称过滤：名称包含 KEY、TOKEN、SECRET、PASSWORD 或 CREDENTIAL 的变量会被剔除并记录 warning。`secret_env` 目前只校验、不注入；配置中禁止包含 `DEEPSEEK_API_KEY`。Claude 和 Codex 使用中转服务时可能依赖它们各自的配置文件，需在目标 Mac 上验证实际认证与调用。
+
+每个 HTTP 请求体上限为 1 MiB，最多同时运行 4 个 prompt，每个会话最多一个。`max_sessions` 统计正在启动或存活的 agent 进程，包括空闲会话和 `list_sessions(source="agent")` 的临时进程。审计文件默认位于 `~/Library/Logs/agent-gateway/`，可用 TOML 的 `defaults.audit_dir` 修改，环境变量 `DOT_GATEWAY_AUDIT_DIR` 优先；新建目录为 0700，已有目录权限过宽时只警告、不修改，审计文件为 0600。审计记录包含经脱敏的 prompt 摘要；`prompt_sha256` 对未经脱敏的原文计算。审计写入失败只记录错误，不中断操作。事件日志和 agent 自己的历史不属于审计日志，不保证同样脱敏。
+
 ## 工具
 
 | 工具 | 作用 |
@@ -40,9 +48,11 @@ tunnel-client 用 `--mcp-server-url http://127.0.0.1:8765/mcp` 连过来。部�
 
 返回值默认是一段紧凑的 JSON（不额外返回 `structuredContent`；部署设置 `DOT_GATEWAY_STRUCTURED_OUTPUT=1` 后会同时返回 structuredContent）。最终答复只投递一次，如果没收到，传 `includeText=true` 或调 `get_session(detail="full")` 再取一次；`messages`/`full` 也可以用交付时相同的 `afterSequence` 重试那一页。
 
-网关不加安全限制，但权限有两层：`permissionMode` 是 agent 自己的沙箱（默认 `workspace-write`）；`permissionPolicy` 只决定网关怎么回答 agent **自己发起**的权限请求，不是每次写入/命令的审批开关。沙箱允许的操作直接执行，所以 `operator` 下 `pendingPermissions` 为空、`permissionRequests` 为 0 是正常的；策略每一轮都可以调整。
+权限有两层：`permissionMode` 是 agent 自己的沙箱；`permissionPolicy` 只决定网关怎么回答 agent **自己发起**的权限请求，不是每次写入/命令的审批开关。TOML 的 `full` 对应 `allow_all`，`operator` 等待审批并在超时后拒绝；旧版 JSON 部署仍使用其原有默认策略。沙箱允许的操作直接执行，所以 `operator` 下 `pendingPermissions` 为空、`permissionRequests` 为 0 是正常的。
 
-某个调用被沙箱拒绝时，dsh 可以对同一调用重试一次、申请严格更宽一档的沙箱（带 `justification`），执行前由 dsh-acp 桥接成 ACP 权限请求。网关策略：`read_only`（默认）自动拒绝这类请求；`allow_all` 自动允许；`deny_all` 自动拒绝；`operator` 挂起在 `pendingPermissions` 里等 `resolve_permission`（条目带 `toolCallId` 和一行回填的工具摘要，回填不到是 `tool`）。选 allow-once 只放宽该次调用，不改变会话的 `permissionMode`；要整会话换档用 `prompt(permissionMode=...)`。
+TOML 中设置 `policy = "operator"` 后，调用方只能选择 `operator` 或更严格的 `deny_all`，不能通过启动、加载或单轮请求放宽。TOML 的 dsh 默认继承四种模式及 `DSH_PERMISSION_MODE`；`auto` 仍需安装并使用 Auto review profile，参见下文。
+
+某个调用被沙箱拒绝时，dsh 可以对同一调用重试一次、申请严格更宽一档的沙箱（带 `justification`），执行前由 dsh-acp 桥接成 ACP 权限请求。网关保留 `read_only`、`allow_all`、`deny_all` 和 `operator` 策略；`operator` 只向调用方提供单次允许和拒绝选项。选 allow-once 只放宽该次调用，不改变会话的 `permissionMode`；要整会话换档用 `prompt(permissionMode=...)`。
 
 限制：dsh-acp 的 ACP 请求只带 `toolCallId`，申请的模式/理由只能从工具输入回填（`command`、`sandboxPermissions`、`justification`）；Auto review 的审查理由没有 ACP 字段，网关看不到。
 

@@ -1,5 +1,7 @@
 # AGENTS.md
 
+> P1 配置以 [README.md](README.md#p1-配置与限制) 和 `agents.example.toml` 为准。
+
 这份文档写给维护本仓库的编码 agent，也写给负责部署和运维的人。面向用户的简介见 [README.md](README.md)。
 
 ## 项目概况
@@ -7,7 +9,7 @@
 - 网关是一个 MCP 服务（Python，`uv` 管理）。它把 MCP 工具调用翻译成 ACP（Agent Client Protocol），通过 stdio 驱动本机的编码 agent。一个 MCP 会话对应一个 ACP 会话，支持多轮对话。
 - 内置的 agent 是 DeepSeek Harness：`dsh --profile acp`。以后接 pi 走 `pi-acp`，在配置文件里加一项就行。
 - 工具名照 [kxress/acp-mcp](https://github.com/kxress/acp-mcp) 起。没有直接用 acp-mcp，原因有两个：它要求 Node ≥ 24.12，而本机是 v22；它的 `load_session` 走 `session/load`，dsh 不支持这个方法。
-- 按所有者的决定，网关**不加安全限制**：没有确认环节，没有仓库白名单，不隔离工作区，不限制推送和合并，不设任务超时，不留审计日志，也没有停用开关。权限策略只决定网关怎么回答 agent **自己发起**的权限请求，不是每次写入或命令的审批开关。
+- 网关限制 cwd 根目录、子进程环境、请求体和并发数，记录脱敏 JSONL 审计，并对 operator 审批设置超时；不额外拦截 agent 自己沙箱已允许的写入、命令或推送。权限策略只决定如何回答 agent **自己发起**的权限请求，不是每次操作的审批开关。
 
 ## 代码结构
 
@@ -92,20 +94,20 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 1. **`permissionMode`：agent 自己的沙箱。** 内置 dsh 的取值是 `read-only`、`workspace-write`（默认）、`danger-full-access`，通过 `DSH_PERMISSION_MODE` 生效；部署可以追加模式（例如 Auto review 的 `auto`，见 [docs/auto-review.md](docs/auto-review.md)）。`start_session` 里设的是会话默认值，`prompt` 里设的只对这一轮生效，`load_session` 也能改会话默认值。模式改了，网关会重启 agent，再用 `session/resume` 接回会话。
 2. **`permissionPolicy`：网关怎么回答这些请求。** 命名照 acp-mcp：
-   - `read_only`（默认）：`read`、`search`、`fetch`、`think` 类的请求选 allow，其他都选 reject。dsh-acp 的升级请求只带 `toolCallId`、不带 `kind`，网关按非读类处理，所以默认策略下这类升级会被自动拒绝；
+   - `read_only`（旧 JSON 默认）：`read`、`search`、`fetch`、`think` 类的请求选 allow，其他都选 reject。dsh-acp 的升级请求只带 `toolCallId`、不带 `kind`，网关按非读类处理，所以该策略下这类升级会被自动拒绝；
    - `allow_all`：全部选 allow；
    - `deny_all`：全部选 reject；
-   - `operator`：请求挂起，出现在 `pendingPermissions` 里，等 `resolve_permission` 用某个 `optionId` 回答。没人回答就一直等着；`cancel_prompt` 会把挂起的请求全部回答为 cancelled。
+   - `operator`：请求挂起，出现在 `pendingPermissions` 里，等 `resolve_permission` 回答；超过 agent 的 `approval_timeout` 时拒绝或取消。`cancel_prompt` 会取消挂起请求。TOML agent 设置 `policy = "operator"` 时只能覆盖为 `operator` 或 `deny_all`，不能放宽；TOML 默认 `full` 对应 `allow_all`。
 
 **dsh 的沙箱升级（escalation）链路。** 某个调用被沙箱拒绝后，模型可以对**同一个调用**重试一次，带上 `sandbox_permissions`（严格更宽一档，例如 `workspace-write` 被拒后申请 `danger-full-access`）和 `justification`。dsh 在执行这次调用前走自己的 approval：`workspace-write` / `read-only` 预设的 approval 是 `ask`，`danger-full-access` 预设是 `never`；`ask` 时 dsh-acp 把它桥接成 ACP 的 `session/request_permission`。审批请求只在这类“agent 申请更宽沙箱”的场景出现，不是每次写入都有。
 
-**空 `pendingPermissions` 和 0 条 `permissionRequests` 通常是正常的。** 实测 dsh 0.2.1-rc.2 在 `workspace-write` 下创建/编辑文件、执行 shell 命令都不会发权限请求，所以默认的 `read_only` 挡不住这类操作，`operator` 也没有东西可挂；没有挂起项不代表策略没生效。
+**空 `pendingPermissions` 和 0 条 `permissionRequests` 通常是正常的。** 实测 dsh 0.2.1-rc.2 在 `workspace-write` 下创建/编辑文件、执行 shell 命令都不会发权限请求，所以 `read_only` 挡不住这类操作，`operator` 也没有东西可挂；没有挂起项不代表策略没生效。
 
 **`pendingPermissions` 的条目**是 `{permissionId, promptId, toolCallId, tool, title?, kind?, status?, command?, commandBytes?, commandTruncated?, sandboxPermissions?, justification?, approvalSource?, review?, options}`。dsh-acp 的请求只带 `toolCallId`，网关会从本会话的工具记录回填 title/kind/status/rawInput：`tool` 是一行摘要；`command` 是完整命令（上限 16 KiB，`commandBytes`/`commandTruncated` 标明是否截断）；`sandboxPermissions` 是 agent 单次扩权申请（如有）；`justification` 是模型给的理由（如有）；Auto review ask 另有 `review` 和 `approvalSource: "auto-review"`。回填不到时只有 `tool`。
 
 **allow-once 只放宽该次调用**，不改变会话的 `permissionMode`。要整个会话换档，用 `prompt(permissionMode=...)`（网关会重启 agent 并 `session/resume`）。
 
-**Auto review（可选部署）。** dsh 自带一个实验性的 Auto review 层：profile 里挂上后权限预设多一个 `auto`（full access + ask），每个受支持的工具调用执行前让当前模型先审一遍。低风险调用直接以 full access 执行；medium/high 风险被拒绝时走 approval `ask`，由 dsh-acp 桥接成 ACP 权限请求。网关要暴露它，需要在 dsh agent 的 `permission_modes` 里加 `auto`（把 args 指向 `--profile acp-auto`），并建议把 `permissionPolicy` 设为 `operator`——否则这类 ask 会被默认的 `read_only` 自动拒绝。
+**Auto review（可选部署）。** dsh 自带一个实验性的 Auto review 层：profile 里挂上后权限预设多一个 `auto`（full access + ask），每个受支持的工具调用执行前让当前模型先审一遍。低风险调用直接以 full access 执行；medium/high 风险被拒绝时走 approval `ask`，由 dsh-acp 桥接成 ACP 权限请求。网关内置 `auto` 档，但必须先安装该插件并把 dsh 命令指向 `--profile acp-auto`；建议把 `permissionPolicy` 设为 `operator`，否则 ask 可能被自动回答。
 
 本仓库的 profile 使用一份 vendored auto-review 插件：reviewer 决定会额外写本地 audit JSONL（`<state_dir>/auto-review-audit/<acpSessionId>.jsonl`），网关读取后把 `reviewMode`、`toolReviews`、`tool_call.review`、`pendingPermissions.review/approvalSource` 返回给调用方；allow 决策按 dsh 协议没有文本 reason（只有 risk/policy），deny/ask 有 reviewer reason。插件还支持 `DSH_AUTO_REVIEW_TEST=allow|ask|deny|by-command` 的确定性测试模式（不要在生产开启），并强化了 REVIEW_POLICY：显式人类约束（不许删除、限定写入目录等）优先于 session-created cleanup。`uv run python scripts/test_auto_review.py` 会走真实 dsh + 脚本化 reviewer 验证 allow/ask/deny 三条分支。Auto review 是实验功能：多花模型调用、可能误放行/误拒绝，只能在 dsh 侧 profile 启用，不是网关的 `permissionPolicy` 取值。安装、配置和回退见 [docs/auto-review.md](docs/auto-review.md)。
 
@@ -144,9 +146,11 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 | `DOT_GATEWAY_PATH` | `--path` | `/mcp` | MCP 路径（Streamable HTTP，无状态模式） |
 | `DOT_GATEWAY_STATE_DIR` | `--state-dir` | `~/Library/Application Support/dot-gateway` | 状态目录 |
 | `DOT_GATEWAY_CONFIG` | `--config` | `<state_dir>/config.json` | agent 配置和默认值 |
+| `DOT_GATEWAY_AGENTS_FILE` | — | `~/.config/agent-gateway/agents.toml` | TOML agent 配置路径 |
+| `DOT_GATEWAY_AUDIT_DIR` | — | `~/Library/Logs/agent-gateway` | 审计目录，优先于 TOML |
 | `DOT_GATEWAY_DSH_BIN` | — | `/opt/homebrew/bin/dsh` | dsh 路径 |
 | `DOT_GATEWAY_DSH_PERMISSION_MODE` | — | `workspace-write` | dsh 默认 permissionMode |
-| `DOT_GATEWAY_PERMISSION_POLICY` | — | `read_only` | 默认 permissionPolicy |
+| `DOT_GATEWAY_PERMISSION_POLICY` | — | `read_only` | 旧 JSON 部署默认 permissionPolicy；TOML 由 agent policy 决定 |
 | `DOT_GATEWAY_STRUCTURED_OUTPUT` | — | 关闭 | 部署级开关：工具结果同时返回 structuredContent；也可在配置 `defaults.structured_output` 里设 |
 | `DOT_GATEWAY_EXTRA_PATH` | — | `/opt/homebrew/bin:/usr/local/bin` | 加到 agent 的 PATH 前面（launchd 下的 PATH 很短） |
 | `DOT_GATEWAY_STARTUP_TIMEOUT` | — | `25` | 启动 agent 时每一步最多等几秒 |

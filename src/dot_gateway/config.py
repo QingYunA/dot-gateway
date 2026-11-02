@@ -1,4 +1,4 @@
-"""Gateway configuration (env vars, CLI flags, optional JSON file). None of these is a security limit."""
+"""Gateway configuration."""
 
 from __future__ import annotations
 
@@ -28,6 +28,11 @@ class Config:
     state_dir: Path = field(default_factory=_default_state_dir)
     # JSON file with extra/overridden agents and defaults; default <state_dir>/config.json
     config_file: Path | None = None
+    agents_file: Path = field(default_factory=lambda: Path.home() / '.config/agent-gateway/agents.toml')
+    cwd_roots: list[str] = field(default_factory=lambda: ['~/cyq'])
+    audit_dir: Path = field(default_factory=lambda: Path.home() / 'Library/Logs/agent-gateway')
+    audit_dir_from_env: bool = False
+    approval_channels: list[str] = field(default_factory=lambda: ['mcp', 'panel'])
     dsh_bin: str = "/opt/homebrew/bin/dsh"
     # Default dsh permission mode for new sessions (empty = workspace-write, dsh's own default).
     dsh_permission_mode: str = ""
@@ -50,6 +55,9 @@ class Config:
         env = dict(os.environ if env is None else env)
         state = Path(env["DOT_GATEWAY_STATE_DIR"]).expanduser() if env.get("DOT_GATEWAY_STATE_DIR") else _default_state_dir()
         c = cls(state_dir=state)
+        c.agents_file = Path(env.get('DOT_GATEWAY_AGENTS_FILE', str(c.agents_file))).expanduser()
+        c.audit_dir = Path(env.get('DOT_GATEWAY_AUDIT_DIR', str(c.audit_dir))).expanduser()
+        c.audit_dir_from_env = bool(env.get('DOT_GATEWAY_AUDIT_DIR'))
         if env.get("DOT_GATEWAY_CONFIG"):
             c.config_file = Path(env["DOT_GATEWAY_CONFIG"]).expanduser()
         c.apply_file_defaults()

@@ -1,0 +1,37 @@
+[defaults]
+cwd_roots = ["~/cyq"]
+approval_channels = ["mcp", "panel"]
+# audit_dir = "~/Library/Logs/agent-gateway"
+
+[[agents]]
+id = "claude"
+command = ["claude-agent-acp"]
+policy = "full"
+max_sessions = 4
+env_allow = []
+secret_env = []
+
+[[agents]]
+id = "codex"
+command = ["codex-acp"]
+
+[[agents]]
+id = "codebuddy"
+command = ["codebuddy", "--acp", "--permission-mode", "bypassPermissions"]
+
+[[agents]]
+id = "kimi"
+command = ["~/.kimi-code/bin/kimi", "acp"]
+
+[[agents]]
+id = "dsh"
+command = ["~/.local/bin/dsh", "--profile", "acp"]
+# 默认继承 read-only、workspace-write、danger-full-access、auto 及 DSH_PERMISSION_MODE。
+# auto 需要安装并配置 acp-auto profile，见 docs/auto-review.md；仅选择该档不安装插件。
+# default_permission_mode = "workspace-write"
+# [agents.permission_modes.custom]
+# env = { DSH_PERMISSION_MODE = "workspace-write" }
+# args = []
+# policy = "operator"
+# approval_timeout = 600
+# cwd_roots = ["~/cyq/project"]

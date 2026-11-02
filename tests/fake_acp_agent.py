@@ -100,12 +100,15 @@ async def run_prompt(sid, text):
                 pass
         elif cmd == "hang":
             await asyncio.sleep(float(rest))
-        elif cmd == "perm":
+        elif cmd in ("perm", "perm_always"):
             tc = {"toolCallId": "tc-" + uuid.uuid4().hex[:6], "title": "do " + rest, "kind": rest}
             update(sid, {"sessionUpdate": "tool_call", **tc, "status": "pending"})
-            r = await client_request("session/request_permission", {"sessionId": sid, "toolCall": tc, "options": [
+            options = [
                 {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
-                {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]})
+                {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]
+            if cmd == "perm_always":
+                options.append({"optionId": "always", "name": "Always", "kind": "allow_always"})
+            r = await client_request("session/request_permission", {"sessionId": sid, "toolCall": tc, "options": options})
             o = r.get("outcome", {})
             say(sid, mid, "permission: " + (o.get("optionId") if o.get("outcome") == "selected" else "cancelled"))
         elif cmd == "escalate":  # dsh-acp-style sandbox escalation ask: only a toolCallId, allow-once/reject-once
@@ -139,6 +142,8 @@ async def run_prompt(sid, text):
             raise RpcError("scripted failure")
         elif cmd == "env":
             say(sid, mid, f"{rest}={os.environ.get(rest, 'unset')}")
+        elif cmd == "env_names":
+            say(sid, mid, json.dumps(sorted(os.environ)))
         elif cmd == "model":
             say(sid, mid, "model=" + h.get("model", "m-small"))
         if s["cancel"].is_set():
