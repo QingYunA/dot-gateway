@@ -405,7 +405,7 @@ def test_builtin_dsh_defaults(tmp_path):
     c = Config(state_dir=tmp_path / "state", config_file=tmp_path / "missing-config.json")
     d = load_registry(c).get("dsh")
     assert d.default_permission_mode == "workspace-write"
-    assert sorted(d.permission_modes) == ["danger-full-access", "read-only", "workspace-write"]
+    assert sorted(d.permission_modes) == ["auto", "danger-full-access", "read-only", "workspace-write"]
     assert c.default_permission_policy == "read_only"
 
 

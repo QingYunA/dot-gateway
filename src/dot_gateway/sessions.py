@@ -28,6 +28,7 @@ from typing import Any
 from . import __version__, gitinfo
 from .acp import PROTOCOL_VERSION, AcpConnection, AcpError, AgentExited
 from .agents import AgentDefinition, AgentError, AgentRegistry
+from .audit import Audit
 from .config import PERMISSION_POLICIES, Config
 from .events import EventLog, atomic_write_json, clip, now_iso
 
@@ -88,12 +89,15 @@ class Runtime:
     pending: dict[str, tuple[asyncio.Future, dict[str, Any]]] = field(default_factory=dict)
     replies: dict[str, dict[str, Any]] = field(default_factory=dict)
     tools: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)  # prompt_id -> toolCallId -> summary
+    slot: bool = False
 
 
-def _validate_policy(policy: str | None, default: str) -> str:
+def _validate_policy(policy: str | None, default: str, agent: AgentDefinition | None = None) -> str:
     p = policy or default
     if p not in PERMISSION_POLICIES:
         raise SessionError("BAD_ARGUMENT", f"permission_policy must be one of {PERMISSION_POLICIES}")
+    if agent is not None and agent.policy == 'operator' and p not in ('operator', 'deny_all'):
+        raise SessionError('BAD_ARGUMENT', 'agent policy operator permits only operator or deny_all permissionPolicy')
     return p
 
 
@@ -121,6 +125,10 @@ class SessionManager:
         self._locks: dict[str, asyncio.Lock] = {}
         self._changed: dict[str, asyncio.Event] = {}
         self._tasks: set[asyncio.Task] = set()
+        self.audit = Audit(config.audit_dir)
+        self._agent_slots: dict[str, int] = {}
+        self._prompt_slots: set[str] = set()
+        self._prompt_owners: dict[str, object] = {}
 
     # ------------------------------------------------------------------ storage
     def _dir(self, sid: str) -> Path:
@@ -227,14 +235,35 @@ class SessionManager:
             await asyncio.wait(tasks, timeout=5)
 
     # ------------------------------------------------------------------ agent processes
-    def _base_env(self) -> dict[str, str]:
-        env = dict(os.environ)
+    def _base_env(self, agent: AgentDefinition) -> dict[str, str]:
+        allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'TERM', 'SHELL', 'TMPDIR', '__CF_USER_TEXT_ENCODING', *agent.env_allow}
+        env = {k: v for k, v in os.environ.items() if k in allowed or k.startswith('LC_')}
         env["PATH"] = self.config.extra_path + ":" + env.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         return env
 
     async def _spawn(self, agent: AgentDefinition, cwd: str, mode: str | None, stderr_path: Path) -> Runtime:
         rt = Runtime(agent=agent, mode=mode)
-        argv, env = agent.launch(mode, self._base_env())
+        count = self._agent_slots.get(agent.id, 0)
+        if count >= agent.max_sessions:
+            raise SessionError('AGENT_SESSION_LIMIT', f'agent {agent.id!r} reached max_sessions={agent.max_sessions}')
+        self._agent_slots[agent.id] = count + 1
+        rt.slot = True
+        try:
+            return await self._spawn_reserved(rt, cwd, mode, stderr_path)
+        except BaseException:
+            if rt.conn is not None:
+                await rt.conn.stop(grace=1)
+            self._release_agent_slot(rt)
+            raise
+
+    def _release_agent_slot(self, rt: Runtime) -> None:
+        if rt.slot:
+            rt.slot = False
+            self._agent_slots[rt.agent.id] -= 1
+
+    async def _spawn_reserved(self, rt: Runtime, cwd: str, mode: str | None, stderr_path: Path) -> Runtime:
+        agent = rt.agent
+        argv, env = agent.launch(mode, self._base_env(agent))
         if env.get("DSH_AUTO_REVIEW") == "1":
             env["DOT_GATEWAY_AUTO_REVIEW_AUDIT_DIR"] = str(self.auto_review_audit_dir)
         rt.conn = AcpConnection(
@@ -281,6 +310,7 @@ class SessionManager:
                 pass
         rt.conn.closed = True
         await rt.conn.stop(grace=grace)
+        self._release_agent_slot(rt)
         if rt.sid and rt.sid in self._records:
             rec = self._records[rt.sid]
             if rec.get("agent_pid") == rt.conn.pid:
@@ -306,8 +336,7 @@ class SessionManager:
         """Start an agent process for an existing session: session/resume, else session/load."""
         sid = rec["session_id"]
         agent = self.registry.get(rec["agent_id"])
-        if not os.path.isdir(rec["cwd"]):
-            raise SessionError("CWD_MISSING", f"session cwd {rec['cwd']} no longer exists")
+        rec['cwd'] = _check_cwd(rec['cwd'], agent.cwd_roots if agent.cwd_roots is not None else self.config.cwd_roots)
         rt = await self._spawn(agent, rec["cwd"], mode, self._dir(sid) / "agent-stderr.log")
         rt.policy = rec["permission_policy"]
         self._register(rt, rec)
@@ -330,9 +359,9 @@ class SessionManager:
                     f"agent {agent.id!r} advertises neither session/resume nor session/load, so this session cannot "
                     "be continued after its agent process ended; start a new session",
                 )
-        except (AcpError, SessionError) as e:
+        except BaseException as e:
             await self._stop_runtime(rt, close_remote=False, grace=1)
-            if isinstance(e, SessionError):
+            if not isinstance(e, AcpError):
                 raise
             raise SessionError("ATTACH_FAILED", f"{method} failed: {e}") from None
         r = r or {}
@@ -434,6 +463,7 @@ class SessionManager:
         raise AcpError(f"{method} is not supported by dot-gateway (client capabilities: no fs, no terminal)", -32601)
 
     def _on_exit(self, rt: Runtime, code: int | None) -> None:
+        self._release_agent_slot(rt)
         if rt.sid is None:
             return
         sid = rt.sid
@@ -480,6 +510,8 @@ class SessionManager:
                 tool.setdefault(key, value)
         options = params.get("options") or []
         policy = rt.policy
+        if policy == 'operator':
+            options = [o for o in options if o.get('kind') in ('allow_once', 'reject_once')]
         pid = "perm-" + uuid.uuid4().hex[:12]
         info = {
             "permissionId": pid,
@@ -495,13 +527,30 @@ class SessionManager:
             if pr is not None:  # visible as prompt.permissionRequests while the turn still runs
                 pr["permission_requests"] = int(pr.get("permission_requests") or 0) + 1
         self._emit(sid, "permission_request", info, rt.prompt_id)
+        audit_tool = dict(info['toolCall'])
+        if isinstance(audit_tool.get('rawInput'), dict):
+            audit_tool['rawInput'] = dict(audit_tool['rawInput'])
+            command = audit_tool['rawInput'].get('command')
+            if isinstance(command, str):
+                audit_tool['rawInput']['command'] = command[:500]
+        self.audit.write(tool='permission_request', agent=rt.agent.id, session=sid,
+                         cwd=self._records.get(sid, {}).get('cwd'), request={**info, 'toolCall': audit_tool})
         by = "policy"
-        if policy == "operator" and sid is not None:
+        if policy == 'operator' and not options:
+            log.warning('Permission request %s has no usable options; cancelling', pid)
+            outcome = {'outcome': 'cancelled'}
+            by = 'no_options'
+        elif policy == "operator" and sid is not None:
             fut = asyncio.get_running_loop().create_future()
             rt.pending[pid] = (fut, info)
             self._sync_pending(rt)
             try:
-                outcome, by = await fut
+                try:
+                    outcome, by = await asyncio.wait_for(fut, timeout=rt.agent.approval_timeout)
+                except asyncio.TimeoutError:
+                    reject = next((o for o in options if o.get('kind') == 'reject_once'), None)
+                    outcome = {'outcome': 'selected', 'optionId': reject['optionId']} if reject else {'outcome': 'cancelled'}
+                    by = 'timeout'
             finally:
                 rt.pending.pop(pid, None)
                 self._sync_pending(rt)
@@ -513,6 +562,8 @@ class SessionManager:
             outcome = {"outcome": "selected", "optionId": opt["optionId"]} if opt else {"outcome": "cancelled"}
         if sid is not None:
             self._emit(sid, "permission_resolved", {"permissionId": pid, "outcome": outcome, "by": by}, rt.prompt_id)
+            self.audit.write(tool='permission_resolved', agent=rt.agent.id, session=sid,
+                             cwd=self._records.get(sid, {}).get('cwd'), decision=outcome, by=by)
         return {"outcome": outcome}
 
     def _sync_pending(self, rt: Runtime) -> None:
@@ -749,10 +800,26 @@ class SessionManager:
         permission_policy: str | None = None,
         config: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        reservation = None
+        if prompt:
+            if len(self._prompt_slots) >= 4:
+                raise SessionError('PROMPT_LIMIT', 'global concurrent prompt limit is 4')
+            reservation = 'starting-' + uuid.uuid4().hex
+            self._prompt_slots.add(reservation)
+        try:
+            return await self._start_session(cwd, agent_id, prompt, permission_mode, permission_policy, config, reservation)
+        finally:
+            if reservation:
+                self._prompt_slots.discard(reservation)
+
+    async def _start_session(
+        self, cwd: str, agent_id: str, prompt: str | None, permission_mode: str | None,
+        permission_policy: str | None, config: dict[str, str] | None, reservation: str | None,
+    ) -> dict[str, Any]:
         agent = self.registry.get(agent_id)
         mode = agent.resolve_mode(permission_mode)
-        policy = _validate_policy(permission_policy, self.config.default_permission_policy)
-        cwd_real = _check_cwd(cwd)
+        policy = _validate_policy(permission_policy, ('allow_all' if agent.policy == 'full' else agent.policy) or self.config.default_permission_policy, agent)
+        cwd_real = _check_cwd(cwd, agent.cwd_roots if agent.cwd_roots is not None else self.config.cwd_roots)
         tmp_err = self.root / f".starting-{uuid.uuid4().hex}.stderr.log"
         rt = await self._spawn(agent, cwd_real, mode, tmp_err)
         rt.policy = policy
@@ -764,10 +831,11 @@ class SessionManager:
                 raise SessionError("AGENT_PROTOCOL", f"agent returned an unusable sessionId {sid!r}")
             if sid in self._records or (self.root / sid).exists():
                 raise SessionError("AGENT_PROTOCOL", f"agent reused an existing session id {sid!r}")
-        except (AcpError, SessionError) as e:
+        except BaseException as e:
             await rt.conn.stop(grace=1)
+            self._release_agent_slot(rt)
             _move(tmp_err, None)
-            if isinstance(e, SessionError):
+            if not isinstance(e, AcpError):
                 raise
             raise SessionError("AGENT_START_FAILED", f"session/new failed: {e}") from None
         d = self._dir(sid)
@@ -806,6 +874,7 @@ class SessionManager:
                 notes.append(str(e))
         res: dict[str, Any] = {}
         if prompt:
+            self._prompt_slots.discard(reservation)
             res = await self.prompt(sid, prompt)
         view = self._summary(rec)
         if notes:
@@ -828,12 +897,13 @@ class SessionManager:
             if known:
                 rec = self._rec(session_id)
                 agent = self.registry.get(rec["agent_id"])
+                rec['cwd'] = _check_cwd(rec['cwd'], agent.cwd_roots if agent.cwd_roots is not None else self.config.cwd_roots)
                 if agent_id and agent_id != rec["agent_id"]:
                     raise SessionError("BAD_ARGUMENT", f"session belongs to agent {rec['agent_id']!r}")
                 if permission_mode:
                     rec["permission_mode"] = agent.resolve_mode(permission_mode)
                 if permission_policy:
-                    rec["permission_policy"] = _validate_policy(permission_policy, rec["permission_policy"])
+                    rec["permission_policy"] = _validate_policy(permission_policy, rec["permission_policy"], agent)
                     if session_id in self._rt:
                         self._rt[session_id].policy = rec["permission_policy"]
                 note = None
@@ -858,13 +928,13 @@ class SessionManager:
                     "session_id": session_id,
                     "acp_session_id": session_id,
                     "agent_id": agent_id,
-                    "cwd": _check_cwd(cwd),
+                    "cwd": _check_cwd(cwd, agent.cwd_roots if agent.cwd_roots is not None else self.config.cwd_roots),
                     "origin": "loaded",
                     "state": "idle",
                     "created_at": now_iso(),
                     "updated_at": now_iso(),
                     "permission_mode": agent.resolve_mode(permission_mode),
-                    "permission_policy": _validate_policy(permission_policy, self.config.default_permission_policy),
+                    "permission_policy": _validate_policy(permission_policy, ('allow_all' if agent.policy == 'full' else agent.policy) or self.config.default_permission_policy, agent),
                     "config_values": {},
                     "config_options": [],
                     "current_prompt_id": None,
@@ -875,7 +945,7 @@ class SessionManager:
                 self._records[session_id] = rec
                 try:
                     await self._attach(rec, rec["permission_mode"])
-                except SessionError:
+                except BaseException:
                     self._records.pop(session_id, None)
                     self._logs.pop(session_id, None)
                     shutil.rmtree(self._dir(session_id), ignore_errors=True)
@@ -886,7 +956,29 @@ class SessionManager:
                 view["note"] = note
             return view
 
-    async def prompt(
+    async def prompt(self, session_id: str, text: str, permission_mode: str | None = None,
+                     permission_policy: str | None = None, wait_ms: int = 0) -> dict[str, Any]:
+        if session_id in self._prompt_slots:
+            current = self._records.get(session_id, {}).get('current_prompt_id')
+            raise SessionError('SESSION_BUSY', f'prompt {current} is still running in this session')
+        if len(self._prompt_slots) >= 4:
+            raise SessionError('PROMPT_LIMIT', 'global concurrent prompt limit is 4')
+        owner = object()
+        self._prompt_slots.add(session_id)
+        self._prompt_owners[session_id] = owner
+        try:
+            return await self._prompt_impl(session_id, text, permission_mode, permission_policy, wait_ms)
+        except BaseException:
+            rt = self._rt.get(session_id)
+            if self._prompt_owners.get(session_id) is owner and (not rt or not rt.prompt_task):
+                self._release_prompt_slot(session_id)
+            raise
+
+    def _release_prompt_slot(self, session_id: str) -> None:
+        self._prompt_owners.pop(session_id, None)
+        self._prompt_slots.discard(session_id)
+
+    async def _prompt_impl(
         self,
         session_id: str,
         text: str,
@@ -909,7 +1001,7 @@ class SessionManager:
                 )
             agent = self.registry.get(rec["agent_id"])
             mode = agent.resolve_mode(permission_mode) if permission_mode else rec["permission_mode"]
-            policy = _validate_policy(permission_policy, rec["permission_policy"])
+            policy = _validate_policy(permission_policy, rec["permission_policy"], agent)
             rt = self._rt.get(session_id)
             resumed = False
             if rt is not None and rt.mode != mode:
@@ -960,7 +1052,15 @@ class SessionManager:
             except AcpError as e:
                 fut = asyncio.get_running_loop().create_future()
                 fut.set_exception(e)
-            rt.prompt_task = self._spawn_task(self._run_prompt(rec, rt, prompt_id, fut))
+            except BaseException as e:
+                pr.update(state='failed', finished_at=now_iso(), error={'message': str(e)})
+                rec['state'], rec['current_prompt_id'], rt.prompt_id = 'idle', None, None
+                self._emit(session_id, 'prompt_finished', {'state': 'failed', 'error': {'message': str(e)}}, prompt_id)
+                pr['last_sequence'] = self._log(session_id).latest
+                self._save(rec)
+                raise
+            rt.prompt_task = self._spawn_task(self._run_prompt(rec, rt, prompt_id, fut, t0))
+            rt.prompt_task.add_done_callback(lambda task: self._prompt_task_done(rec, rt, prompt_id, task))
         if wait_ms:
             # Total call time (including any agent restart) stays under MAX_PROMPT_WAIT_MS.
             budget = min(max(0, int(wait_ms)), MAX_PROMPT_WAIT_MS) / 1000 - (time.monotonic() - t0)
@@ -975,7 +1075,27 @@ class SessionManager:
             out["permission_note"] = OPERATOR_PERMISSION_NOTE
         return out
 
-    async def _run_prompt(self, rec: dict[str, Any], rt: Runtime, prompt_id: str, fut: asyncio.Future) -> None:
+    def _prompt_task_done(self, rec: dict[str, Any], rt: Runtime, prompt_id: str, task: asyncio.Task) -> None:
+        error = 'prompt task cancelled' if task.cancelled() else task.exception()
+        if error is None or rec.get('current_prompt_id') != prompt_id:
+            return
+        sid = rec['session_id']
+        pr = self._prompt(rec, prompt_id)
+        if pr is not None:
+            pr.update(state='failed', finished_at=now_iso(), error={'message': str(error)})
+        self._resolve_all_pending(rt, 'prompt_failed')
+        rt.prompt_id = None
+        rt.prompt_task = None
+        rec['state'] = 'idle'
+        rec['current_prompt_id'] = None
+        self._release_prompt_slot(sid)
+        self._emit(sid, 'prompt_finished', {'state': 'failed', 'error': {'message': str(error)}}, prompt_id)
+        if pr is not None:
+            pr['last_sequence'] = self._log(sid).latest
+        self._save(rec)
+
+    async def _run_prompt(self, rec: dict[str, Any], rt: Runtime, prompt_id: str, fut: asyncio.Future,
+                          started: float) -> None:
         sid = rec["session_id"]
         stop_reason = None
         error = None
@@ -1022,10 +1142,13 @@ class SessionManager:
             rt.cancel_requested = False
         rec["state"] = "idle" if rec["state"] == "busy" else rec["state"]
         rec["current_prompt_id"] = None
+        self._release_prompt_slot(sid)
         self._emit(sid, "prompt_finished", {"state": state, "stopReason": stop_reason, "error": error}, prompt_id)
         if pr is not None:
             pr["last_sequence"] = self._log(sid).latest
         self._save(rec)
+        self.audit.write(tool='prompt_finished', agent=rec['agent_id'], session=sid, cwd=rec['cwd'],
+                         result=state, prompt_id=prompt_id, duration_ms=round((time.monotonic() - started) * 1000))
 
     async def get_events(
         self,
@@ -1281,7 +1404,9 @@ class SessionManager:
         rec.setdefault("config_values", {})[config_id] = value
         self._emit(rec["session_id"], "config_set", {"configId": config_id, "value": value})
 
-    def resolve_permission(self, session_id: str, permission_id: str, option_id: str) -> dict[str, Any]:
+    def resolve_permission(self, session_id: str, permission_id: str, option_id: str, channel: str = 'mcp') -> dict[str, Any]:
+        if channel not in self.config.approval_channels:
+            raise SessionError('APPROVAL_CHANNEL_DISABLED', f'approval channel {channel!r} is disabled')
         rec = self._rec(session_id)
         rt = self._rt.get(session_id)
         entry = rt.pending.get(permission_id) if rt else None
@@ -1292,7 +1417,7 @@ class SessionManager:
             raise SessionError("BAD_ARGUMENT", f"option {option_id!r} not offered; options: "
                                f"{[o.get('optionId') for o in info['options']]}")
         if not fut.done():
-            fut.set_result(({"outcome": "selected", "optionId": option_id}, "caller"))
+            fut.set_result(({"outcome": "selected", "optionId": option_id}, 'caller' if channel == 'mcp' else channel))
         return {"session_id": session_id, "state": rec["state"],
                 "resolved": {"permission_id": permission_id, "option_id": option_id}}
 
@@ -1383,7 +1508,8 @@ class SessionManager:
 
     async def _list_agent_sessions(self, agent_id: str, cwd: str | None, cursor: str | None, limit: int) -> dict[str, Any]:
         agent = self.registry.get(agent_id)
-        where = _check_cwd(cwd) if cwd else str(Path.home())
+        roots = agent.cwd_roots if agent.cwd_roots is not None else self.config.cwd_roots
+        where = _check_cwd(cwd or (roots[0] if roots else None), roots)
         err = Path(self.config.state_dir) / f".list-{uuid.uuid4().hex}.stderr.log"
         rt = await self._spawn(agent, where, agent.default_permission_mode, err)
         try:
@@ -1400,6 +1526,7 @@ class SessionManager:
         finally:
             rt.conn.closed = True
             await rt.conn.stop(grace=2)
+            self._release_agent_slot(rt)
             _move(err, None)
         sessions = []
         for s in (r.get("sessions") or [])[:limit]:
@@ -1465,15 +1592,18 @@ def _tool_output_text(full: dict[str, Any]) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _check_cwd(cwd: str | None) -> str:
+def _check_cwd(cwd: str | None, roots: list[str]) -> str:
     if not cwd or not isinstance(cwd, str):
         raise SessionError("BAD_ARGUMENT", "cwd is required (absolute path of an existing directory)")
     p = os.path.expanduser(cwd)
     if not os.path.isabs(p):
         raise SessionError("BAD_ARGUMENT", "cwd must be an absolute path")
     if not os.path.isdir(p):
-        raise SessionError("BAD_ARGUMENT", f"cwd does not exist or is not a directory: {p}")
-    return os.path.realpath(p)
+        raise SessionError("CWD_MISSING", f"cwd does not exist or is not a directory: {p}")
+    resolved = os.path.realpath(p)
+    if not any(os.path.commonpath([resolved, os.path.realpath(os.path.expanduser(root))]) == os.path.realpath(os.path.expanduser(root)) for root in roots):
+        raise SessionError('CWD_NOT_ALLOWED', f'cwd is outside allowed roots: {p}')
+    return resolved
 
 
 def _append_text(path: Path, text: str) -> None:

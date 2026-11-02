@@ -8,6 +8,8 @@ import functools
 import json
 import logging
 import os
+import inspect
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,10 @@ _STRUCTURED_OUTPUT = False
 
 INSTRUCTIONS = """\
 Run coding agents (default: dsh, DeepSeek Harness) on this machine as multi-turn ACP sessions.
+TOML agent configurations default to policy full (allow_all); operator waits at most the configured
+approval_timeout (default 600 seconds), and exposes only allow_once and reject_once. Legacy JSON settings
+retain their configured default. cwd must resolve inside an allowed root; requests are limited to 1 MiB,
+with at most four concurrent prompts and each agent's configured max_sessions live processes.
 Flow: start_session(cwd) -> prompt(sessionId, text) -> get_events(sessionId, waitMs=25000) until
 prompt.state is completed / failed / cancelled (the default view 'final' long-polls until the turn ends or a
 permission question appears) -> read prompt.text (the agent's final reply, sent once) and prompt.toolCalls
@@ -55,7 +61,7 @@ get_tool_call as evidence, not an exit code.
 Permissions have two layers. permissionMode is the agent's own sandbox (built-in dsh: read-only |
 workspace-write | danger-full-access; a deployment may advertise extra modes such as 'auto', see
 list_agents); it is not an approval switch. permissionPolicy (read_only | allow_all | deny_all |
-operator; default read_only) only decides how the gateway answers permission requests the agent sends itself:
+operator; legacy default read_only) only decides how the gateway answers permission requests the agent sends itself:
 read_only auto-rejects non-read requests, allow_all auto-allows, deny_all auto-rejects, and operator holds a
 request in pendingPermissions until resolve_permission. Work the sandbox already allows needs no approval, so
 empty pendingPermissions and permissionRequests=0 are normal, not a broken setting.
@@ -147,9 +153,43 @@ def build_server(manager: SessionManager) -> MCPServer:
     _STRUCTURED_OUTPUT = manager.config.structured_output
     # structured_output=False keeps output schemas out; when the deployment switch is on, compact() attaches
     # structuredContent manually next to the same text block.
-    tool = functools.partial(server.tool, structured_output=False)
+    def tool(**options):
+        def register(fn):
+            signature = inspect.signature(fn)
 
-    @tool(description="List configured ACP agents (dsh built in; more via the gateway config file), "
+            @functools.wraps(fn)
+            async def audited(*args, **kwargs):
+                if fn.__name__ in {'get_events', 'get_session', 'get_tool_call', 'list_sessions', 'list_agents'}:
+                    return await fn(*args, **kwargs)
+                bound = signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                values = bound.arguments
+                sid = values.get('sessionId')
+                rec = manager._records.get(sid, {}) if sid else {}
+                start = time.monotonic()
+                result = 'ok'
+                try:
+                    response = await fn(*args, **kwargs)
+                    try:
+                        obj = json.loads(response) if isinstance(response, str) else response.structured_content
+                        if isinstance(obj, dict):
+                            sid = obj.get('sessionId', sid)
+                            rec = manager._records.get(sid, rec)
+                    except (ValueError, AttributeError):
+                        pass
+                    return response
+                except BaseException as exc:
+                    result = str(exc)
+                    raise
+                finally:
+                    manager.audit.write(tool=fn.__name__, agent=rec.get('agent_id', values.get('agentId')),
+                                        session=sid, cwd=rec.get('cwd', values.get('cwd')),
+                                        prompt=values.get('text', values.get('prompt')),
+                                        duration_ms=round((time.monotonic() - start) * 1000), result=result)
+            return server.tool(structured_output=False, **options)(audited)
+        return register
+
+    @tool(description="List configured ACP agents, "
           "their permission modes, and the permission policies.")
     async def list_agents() -> str:
         return _sync(manager.list_agents)
@@ -159,7 +199,7 @@ def build_server(manager: SessionManager) -> MCPServer:
         "Returns sessionId (and promptId if `prompt` was given) at once; the first turn runs in the background - "
         "poll get_events. permissionMode values and the default are listed by list_agents for the chosen agent "
         "(built-in dsh: read-only | workspace-write | danger-full-access; a deployment may add e.g. auto for "
-        f"Auto review). permissionPolicy ({policies}; default read_only) only "
+        f"Auto review). permissionPolicy ({policies}; default from the agent configuration) only "
         "decides how the gateway answers permission requests the agent sends itself; sandbox-allowed work needs "
         "no approval, so an empty pendingPermissions is normal, and under 'operator' the returned summary "
         "includes permissionNote. `model` (e.g. deepseek-v4-pro) or `config` "
@@ -319,7 +359,33 @@ def make_app(manager: SessionManager):
     # of Starlette's plain-text "Not Found", so JSON-parsing clients see "no such resource", not a parse error.
     # No auth metadata is advertised. The MCP endpoint itself is untouched.
     app.add_exception_handler(404, _json_not_found)
+    app.add_middleware(BodyLimitMiddleware)
     return app
+
+
+class BodyLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
+        messages = []
+        size = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            size += len(message.get('body', b''))
+            if size > 1024 * 1024:
+                from starlette.responses import JSONResponse
+                return await JSONResponse({'error': 'request_body_too_large'}, status_code=413)(scope, receive, send)
+            if message['type'] != 'http.request' or not message.get('more_body', False):
+                break
+
+        async def replay():
+            return messages.pop(0) if messages else await receive()
+
+        await self.app(scope, replay, send)
 
 
 async def _json_not_found(request, exc):

@@ -37,6 +37,9 @@ def fake_agent(agent_id, fake_state, caps="resume,list,close"):
 def make_manager(tmp_path, fake_state):
     def _make(state_dir=None):
         c = Config(state_dir=Path(state_dir or tmp_path / "state"))
+        c.cwd_roots = [str(tmp_path)]
+        c.audit_dir = tmp_path / 'audit'
+        c.agents_file = tmp_path / 'absent.toml'
         c.startup_timeout = 20
         reg = load_registry(c)
         reg.register(fake_agent("fake", fake_state))
